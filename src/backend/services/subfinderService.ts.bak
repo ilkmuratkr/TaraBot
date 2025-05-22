@@ -1,0 +1,859 @@
+import { exec } from 'child_process';
+import { promisify } from 'util';
+import { v4 as uuidv4 } from 'uuid';
+import fs from 'fs/promises';
+import path from 'path';
+import { redisClient } from '../server';
+// @ts-ignore
+import fetch from 'node-fetch';
+import dns from 'dns';
+
+const execAsync = promisify(exec);
+
+// Redis key önekleri
+const SUBFINDER_KEY_PREFIX = 'subfinder:';
+const SUBFINDER_RESULT_KEY_PREFIX = 'subfinder:result:';
+
+// SubFinder taraması için seçenekler
+export interface SubfinderOptions {
+  timeout?: number;         // İstek zaman aşımı (saniye)
+  concurrency?: number;     // Eşzamanlı işlem sayısı
+  resolvers?: string[];     // DNS sunucuları
+  outputFormat?: 'json' | 'text'; // Çıktı formatı
+  onlyActive?: boolean;     // Sadece aktif subdomainleri göster (-nW)
+  verbose?: boolean;        // Detaylı çıktı
+  usePermutations?: boolean; // Alt domain permütasyonlarını kullan
+  useRecursive?: boolean;   // Alt domainler için özyinelemeli tarama yap
+  deepDnsSearch?: boolean;  // Derinlemesine DNS kayıtlarını araştır
+  useWaybackMachine?: boolean; // Wayback Machine arşivlerini kullan
+}
+
+// SubFinder tarama durumu ve verileri
+export interface SubfinderJobData {
+  id: string;
+  domain: string;
+  createdAt: Date;
+  options: SubfinderOptions;
+  status: 'pending' | 'running' | 'completed' | 'failed' | 'stopped';
+  progress?: {
+    total: number;
+    current: number;
+    percent: number;
+  };
+  result?: SubfinderResult[];
+  error?: string;
+}
+
+// SubFinder sonuç veri yapısı
+export interface SubfinderResult {
+  host: string;
+  source?: string[] | string;
+  ip?: string;
+  input?: string;
+}
+
+// SubFinder'ın kurulu olup olmadığını kontrol et
+async function isSubfinderInstalled(): Promise<boolean> {
+  try {
+    await execAsync('which subfinder');
+    return true;
+  } catch (error) {
+    return false;
+  }
+}
+
+// Yeni bir SubFinder taraması oluştur
+export async function createSubfinderScan(
+  domain: string,
+  options: SubfinderOptions = {}
+): Promise<SubfinderJobData> {
+  const id = uuidv4();
+  const job: SubfinderJobData = {
+    id,
+    domain,
+    createdAt: new Date(),
+    options,
+    status: 'pending'
+  };
+
+  await redisClient.set(SUBFINDER_KEY_PREFIX + id, JSON.stringify(job));
+  
+  return job;
+}
+
+// SubFinder taramasını başlat
+export async function startSubfinderScan(id: string): Promise<SubfinderJobData | null> {
+  const jobData = await getSubfinderScan(id);
+  if (!jobData) return null;
+
+  if (jobData.status === 'running') {
+    return jobData;
+  }
+
+  // Tarama durumunu güncelle
+  jobData.status = 'running';
+  await redisClient.set(SUBFINDER_KEY_PREFIX + id, JSON.stringify(jobData));
+
+  // Taramayı asenkron olarak başlat
+  runSubfinderScan(id, jobData).catch(error => {
+    console.error(`SubFinder taraması başlatılamadı (${id}):`, error);
+  });
+
+  return jobData;
+}
+
+// SubFinder taramasını durdur
+export async function stopSubfinderScan(id: string): Promise<SubfinderJobData | null> {
+  const jobData = await getSubfinderScan(id);
+  if (!jobData) return null;
+
+  if (jobData.status !== 'running') {
+    return jobData;
+  }
+
+  // Tarama durumunu güncelle
+  jobData.status = 'stopped';
+  await redisClient.set(SUBFINDER_KEY_PREFIX + id, JSON.stringify(jobData));
+
+  // Bu noktada taramayı durduracak bir işlem yapılabilir
+  // Şu anda tarama zaten tamamlanmış veya hata vermiş olabilir
+
+  return jobData;
+}
+
+// Tüm SubFinder taramalarını getir
+export async function getAllSubfinderScans(): Promise<SubfinderJobData[]> {
+  const keys = await redisClient.keys(SUBFINDER_KEY_PREFIX + '*');
+  const resultKeys = keys.filter(key => !key.includes(':result:'));
+  
+  const scans: SubfinderJobData[] = [];
+  for (const key of resultKeys) {
+    const data = await redisClient.get(key);
+    if (data) {
+      scans.push(JSON.parse(data));
+    }
+  }
+  
+  return scans;
+}
+
+// Belirli bir SubFinder taramasını getir
+export async function getSubfinderScan(id: string): Promise<SubfinderJobData | null> {
+  const data = await redisClient.get(SUBFINDER_KEY_PREFIX + id);
+  return data ? JSON.parse(data) : null;
+}
+
+// SubFinder tarama sonuçlarını getir
+export async function getSubfinderResults(
+  id: string,
+  page = 0,
+  limit = 100
+): Promise<SubfinderResult[]> {
+  // Önce Redis'ten almaya çalış
+  const data = await redisClient.get(SUBFINDER_RESULT_KEY_PREFIX + id);
+  if (data) {
+    const results: SubfinderResult[] = JSON.parse(data);
+    const startIndex = page * limit;
+    return results.slice(startIndex, startIndex + limit);
+  }
+  
+  // Redis'te yoksa dosyadan okumayı dene
+  try {
+    const outputFile = path.join(process.cwd(), 'temp', `subfinder-${id}.json`);
+    const fileExists = await fs.stat(outputFile).catch(() => false);
+    
+    if (fileExists) {
+      console.log(`Redis'te sonuç bulunamadı, dosyadan okunuyor: ${outputFile}`);
+      const resultData = await fs.readFile(outputFile, 'utf-8');
+      
+      if (resultData && resultData.trim()) {
+        const results = resultData
+          .split('\n')
+          .filter(line => line.trim() !== '')
+          .map(line => {
+            try {
+              return JSON.parse(line) as SubfinderResult;
+            } catch (e) {
+              console.error(`JSON parse hatası (${id}, satır): ${line}`, e);
+              return null;
+            }
+          })
+          .filter((item): item is SubfinderResult => item !== null);
+        
+        // Sonuçları Redis'e kaydet
+        await redisClient.set(SUBFINDER_RESULT_KEY_PREFIX + id, JSON.stringify(results));
+        
+        // İstenen sayfayı döndür
+        const startIndex = page * limit;
+        return results.slice(startIndex, startIndex + limit);
+      }
+    }
+  } catch (error) {
+    console.error(`Dosyadan sonuçları okuma hatası (${id}):`, error);
+  }
+  
+  // Hiçbir yerden sonuç alınamadıysa boş dizi döndür
+  return [];
+}
+
+// Belirli bir SubFinder taramasını sil
+export async function deleteSubfinderScan(id: string): Promise<boolean> {
+  try {
+    const scan = await getSubfinderScan(id);
+    if (!scan) throw new Error('SubFinder taraması bulunamadı');
+    
+    console.log(`SubFinder taraması siliniyor: ${id}`);
+    
+    // Önce taramayı durdur (eğer hala çalışıyorsa)
+    if (scan.status === 'running') {
+      await stopSubfinderScan(id);
+      // Kısa bir bekleme ekle
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+    
+    // Redis'ten tarama verilerini sil
+    const redisKeys = [
+      SUBFINDER_KEY_PREFIX + id,            // Ana tarama verisi
+      SUBFINDER_RESULT_KEY_PREFIX + id,     // Tarama sonuçları
+    ];
+    
+    // Tüm tarama ile ilgili redis anahtarlarını sil
+    for (const key of redisKeys) {
+      await redisClient.del(key);
+    }
+    
+    return true;
+  } catch (error) {
+    console.error(`SubFinder taraması silinirken hata (${id}):`, error);
+    return false;
+  }
+}
+
+// DNS kayıtlarını derinlemesine inceleme
+async function performDeepDnsSearch(domain: string): Promise<string[]> {
+  try {
+    const additionalDomains: string[] = [];
+    
+    // MX kayıtlarını kontrol et
+    console.log(`MX kayıtları için inceleniyor: ${domain}`);
+    try {
+      const { stdout: mxOutput } = await execAsync(`dig MX ${domain} +short`);
+      const mxRecords = mxOutput.split('\n').filter(line => line.trim() !== '');
+      
+      for (const record of mxRecords) {
+        // MX kayıtlarından domain adlarını çıkar (10 mail.example.com. -> mail.example.com)
+        const match = record.match(/\d+\s+([^.\s]+\.[^.\s]+\.[^.\s]+\.?)$/);
+        if (match && match[1]) {
+          const mxDomain = match[1].replace(/\.$/, ''); // Sondaki noktayı kaldır
+          console.log(`MX kaydından domain bulundu: ${mxDomain}`);
+          additionalDomains.push(mxDomain);
+        }
+      }
+    } catch (mxError) {
+      console.error(`MX kayıtları alınamadı:`, mxError);
+    }
+    
+    // TXT kayıtlarını kontrol et (SPF, DKIM, vb.)
+    console.log(`TXT kayıtları için inceleniyor: ${domain}`);
+    try {
+      const { stdout: txtOutput } = await execAsync(`dig TXT ${domain} +short`);
+      const txtRecords = txtOutput.split('\n').filter(line => line.trim() !== '');
+      
+      for (const record of txtRecords) {
+        // SPF kayıtlarından domain'leri çıkar
+        if (record.includes('include:')) {
+          const includes = record.match(/include:([^\s"]+)/g);
+          if (includes) {
+            for (const include of includes) {
+              const domain = include.replace('include:', '');
+              console.log(`SPF kaydından domain bulundu: ${domain}`);
+              additionalDomains.push(domain);
+            }
+          }
+        }
+        
+        // DKIM kayıtlarından domain'leri çıkar
+        if (record.includes('._domainkey')) {
+          const match = record.match(/([^.\s]+\.[^.\s]+\.[^.\s]+)\.?$/);
+          if (match && match[1]) {
+            const dkimDomain = match[1].replace(/\.$/, '');
+            console.log(`DKIM kaydından domain bulundu: ${dkimDomain}`);
+            additionalDomains.push(dkimDomain);
+          }
+        }
+      }
+    } catch (txtError) {
+      console.error(`TXT kayıtları alınamadı:`, txtError);
+    }
+    
+    // CNAME kayıtlarını kontrol et
+    console.log(`CNAME kayıtları için inceleniyor: ${domain}`);
+    try {
+      // CNAME kayıtlarını al
+      const { stdout: cnameOutput } = await execAsync(`dig CNAME ${domain} +short`);
+      const cnameRecords = cnameOutput.split('\n').filter(line => line.trim() !== '');
+      
+      for (const record of cnameRecords) {
+        const cnameDomain = record.replace(/\.$/, '');
+        console.log(`CNAME kaydından domain bulundu: ${cnameDomain}`);
+        additionalDomains.push(cnameDomain);
+      }
+    } catch (cnameError) {
+      console.error(`CNAME kayıtları alınamadı:`, cnameError);
+    }
+    
+    // Benzersiz domain'leri döndür
+    return Array.from(new Set(additionalDomains));
+  } catch (error) {
+    console.error(`Derinlemesine DNS araştırması sırasında hata:`, error);
+    return [];
+  }
+}
+
+// Wayback Machine'den tarihsel subdomain'leri çıkar
+async function getWaybackDomains(domain: string): Promise<string[]> {
+  try {
+    console.log(`Wayback Machine için sorgu yapılıyor: ${domain}`);
+    
+    // CommonCrawl ve web.archive.org API'lerini kullan
+    const waybackUrls: string[] = [];
+    
+    // Wayback Machine API'sini kullan
+    try {
+      const waybackUrl = `http://web.archive.org/cdx/search/cdx?url=*.${domain}&output=json&fl=original&collapse=urlkey`;
+      const response = await fetch(waybackUrl);
+      
+      if (response.ok) {
+        const data = await response.json() as any[];
+        
+        // İlk satır başlık satırıdır, o yüzden atlıyoruz
+        for (let i = 1; i < data.length; i++) {
+          const url = data[i][0];
+          waybackUrls.push(url);
+        }
+        
+        console.log(`Wayback Machine'den ${waybackUrls.length} URL bulundu`);
+      } else {
+        console.error(`Wayback Machine API hatası: ${response.status} ${response.statusText}`);
+      }
+    } catch (waybackError) {
+      console.error('Wayback Machine API hatası:', waybackError);
+    }
+    
+    // CommonCrawl API'sini kullan
+    try {
+      const commonCrawlUrl = `https://index.commoncrawl.org/CC-MAIN-2023-50-index?url=*.${domain}&output=json`;
+      const response = await fetch(commonCrawlUrl);
+      
+      if (response.ok) {
+        const text = await response.text();
+        const lines: string[] = text.split('\n').filter((line: string) => line.trim() !== '');
+        
+        for (const line of lines) {
+          try {
+            const data = JSON.parse(line) as any;
+            waybackUrls.push(data.url);
+          } catch (e) {
+            // JSON parse hatası, atla
+          }
+        }
+        
+        console.log(`CommonCrawl'dan ${lines.length} URL bulundu`);
+      } else {
+        console.error(`CommonCrawl API hatası: ${response.status} ${response.statusText}`);
+      }
+    } catch (commonCrawlError) {
+      console.error('CommonCrawl API hatası:', commonCrawlError);
+    }
+    
+    // URL'lerden subdomain'leri çıkar
+    const subdomains = new Set<string>();
+    
+    const urlPattern = /^https?:\/\/([^\/]+)\./;
+    
+    for (const url of waybackUrls) {
+      try {
+        const urlObj = new URL(url);
+        const hostname = urlObj.hostname;
+        
+        // Ana domain'i çıkar
+        if (hostname.endsWith(`.${domain}`)) {
+          const subdomain = hostname.slice(0, -(domain.length + 1)); // .domain kısmını çıkar
+          
+          if (subdomain && subdomain.trim() !== '') {
+            subdomains.add(`${subdomain}.${domain}`);
+          }
+        }
+      } catch (e) {
+        // Geçersiz URL, atla
+      }
+    }
+    
+    console.log(`Wayback Machine ve CommonCrawl'dan toplam ${subdomains.size} benzersiz subdomain bulundu`);
+    return Array.from(subdomains);
+  } catch (error) {
+    console.error('Wayback Machine taraması sırasında hata:', error);
+    return [];
+  }
+}
+
+// SubFinder taramasını çalıştır
+async function runSubfinderScan(id: string, jobData: SubfinderJobData): Promise<void> {
+  try {
+    // SubFinder'ın kurulu olup olmadığını kontrol et
+    const isInstalled = await isSubfinderInstalled();
+    if (!isInstalled) {
+      console.error(`SubFinder kurulu değil. Lütfen önce SubFinder'ı yükleyin.`);
+      
+      // Tarama durumunu güncelle
+      const updatedJobData = await getSubfinderScan(id);
+      if (updatedJobData) {
+        updatedJobData.status = 'failed';
+        updatedJobData.error = 'SubFinder kurulu değil. Lütfen önce SubFinder\'ı yükleyin.';
+        await redisClient.set(SUBFINDER_KEY_PREFIX + id, JSON.stringify(updatedJobData));
+      }
+      
+      return;
+    }
+    
+    const { domain, options } = jobData;
+    const outputDir = path.join(process.cwd(), 'temp');
+    const outputFile = path.join(outputDir, `subfinder-${id}.json`);
+    
+    // Temp klasörünün varlığını kontrol et, yoksa oluştur
+    try {
+      await fs.access(outputDir);
+      console.log(`Temp klasörü mevcut: ${outputDir}`);
+    } catch {
+      console.log(`Temp klasörü oluşturuluyor: ${outputDir}`);
+      await fs.mkdir(outputDir, { recursive: true });
+    }
+    
+    // Mevcut dosyayı temizle
+    try {
+      await fs.writeFile(outputFile, '');
+      console.log(`Çıktı dosyası sıfırlandı: ${outputFile}`);
+    } catch (error) {
+      console.error(`Çıktı dosyası sıfırlanamadı: ${outputFile}`, error);
+    }
+
+    // Çalışma dizini kontrolü
+    console.log(`Çalışma dizini: ${process.cwd()}`);
+    
+    // Tarama komutunu oluştur
+    const subfinderArgs = [
+      '-d', domain,
+      '-o', outputFile,
+      '-oJ'
+    ];
+    
+    if (options.timeout) subfinderArgs.push('-timeout', options.timeout.toString());
+    if (options.concurrency) subfinderArgs.push('-t', options.concurrency.toString());
+    if (options.onlyActive) subfinderArgs.push('-nW');
+    if (options.resolvers && options.resolvers.length > 0) {
+      subfinderArgs.push('-r', options.resolvers.join(','));
+    }
+    
+    // Tüm kaynakları etkinleştir
+    subfinderArgs.push('-all');
+    
+    // Tarama komutunu çalıştır
+    const command = `subfinder ${subfinderArgs.join(' ')}`;
+    console.log(`SubFinder taraması başlatılıyor (${id}): ${command}`);
+    
+    try {
+      const { stdout, stderr } = await execAsync(command, { 
+        timeout: 300000, // 5 dakika
+        maxBuffer: 5 * 1024 * 1024, // 5MB buffer
+      });
+      
+      console.log(`SubFinder stdout (${id}): ${stdout.substring(0, 500)}${stdout.length > 500 ? '...' : ''}`);
+      console.log(`SubFinder stderr (${id}): ${stderr}`);
+      
+      // Çıktı dosyasını kontrol et
+      const fileExists = await fs.stat(outputFile).catch(() => false);
+      
+      if (!fileExists) {
+        throw new Error('SubFinder çıktı dosyası oluşturulamadı');
+      }
+      
+      const fileSize = (await fs.stat(outputFile)).size;
+      console.log(`SubFinder çıktı dosyası boyutu (${id}): ${fileSize} bayt`);
+      
+      // Çıktı dosyasının içeriğini oku
+      const fileContent = await fs.readFile(outputFile, 'utf-8');
+      console.log(`SubFinder sonuç dosyası içeriği (${id}, boyut: ${fileSize}): ${fileContent.substring(0, 100)}${fileContent.length > 100 ? '...' : ''}`);
+      
+      // Sonuçları JSON olarak ayrıştır
+      let results: SubfinderResult[] = [];
+      
+      if (fileContent && fileContent.trim()) {
+        const lines = fileContent.split('\n').filter(line => line.trim() !== '');
+        
+        for (const line of lines) {
+          try {
+            const result = JSON.parse(line);
+            results.push(result);
+          } catch (e) {
+            console.warn(`SubFinder sonucu ayrıştırılamadı: ${line}`);
+          }
+        }
+        
+        console.log(`SubFinder sonuçları parse edildi (${id}): ${results.length} adet sonuç`);
+        
+        // Sonuçları Redis'e kaydet
+        await redisClient.set(SUBFINDER_RESULT_KEY_PREFIX + id, JSON.stringify(results));
+      } else {
+        console.warn(`SubFinder sonuç dosyası boş (${id})`);
+      }
+      
+      // Permütasyon tabanlı tarama
+      if (options.usePermutations && results.length > 0) {
+        console.log(`Permütasyon tabanlı keşif başlatılıyor: ${domain}`);
+        
+        // En çok 10 tane alt domain özelliği al
+        // Mevcut alt domainlerden ön ekler çıkar
+        const existingPrefixes = new Set<string>();
+        results.forEach(result => {
+          const host = result.host;
+          const prefix = host.split('.')[0]; // ilk parçayı al (alt domain ön eki)
+          if (prefix && prefix !== domain.split('.')[0]) {
+            existingPrefixes.add(prefix);
+          }
+        });
+        
+        console.log(`Mevcut alt domainlerden çıkarılan ön ekler: ${Array.from(existingPrefixes).join(', ')}`);
+        
+        // Wordlist'ten en popüler 20 ön ek seç
+        try {
+          const wordlistPath = path.join(process.cwd(), 'wordlists', 'subdomains.txt');
+          const wordlistExists = await fs.stat(wordlistPath).catch(() => false);
+          
+          if (wordlistExists) {
+            const wordlistContent = await fs.readFile(wordlistPath, 'utf-8');
+            const wordlist = wordlistContent.split('\n')
+              .filter(line => line.trim() !== '')
+              .slice(0, 20); // Sadece ilk 20 alt domain ön ekini kullan
+            
+            console.log(`Permütasyon için seçilen wordlist: ${wordlist.join(', ')}`);
+            
+            // Her bir ön ek için kontrol et
+            const permutationResults: SubfinderResult[] = [];
+            const domainParts = domain.split('.');
+            
+            for (const prefix of wordlist) {
+              if (existingPrefixes.has(prefix)) {
+                console.log(`Prefix "${prefix}" zaten mevcut alt domainlerde var, atlıyor.`);
+                continue;
+              }
+              
+              const permutationDomain = `${prefix}.${domain}`;
+              console.log(`Permütasyon domaini kontrol ediliyor: ${permutationDomain}`);
+              
+              try {
+                // DNS sorgusu ile doğrula
+                const dnsLookupPromise = new Promise<boolean>((resolve) => {
+                  dns.resolve(permutationDomain, (err, addresses) => {
+                    if (err) {
+                      resolve(false);
+                    } else {
+                      resolve(true);
+                    }
+                  });
+                });
+                
+                const exists = await dnsLookupPromise;
+                
+                if (exists) {
+                  console.log(`Permütasyon domaini bulundu: ${permutationDomain}`);
+                  permutationResults.push({
+                    host: permutationDomain,
+                    source: ['permutation'],
+                    input: domain
+                  });
+                }
+              } catch (permError) {
+                console.error(`Permütasyon kontrolü hatası (${permutationDomain}):`, permError);
+              }
+            }
+            
+            // Permütasyon sonuçlarını ana sonuçlara ekle
+            if (permutationResults.length > 0) {
+              console.log(`${permutationResults.length} permütasyon sonucu ekleniyor`);
+              results = [...results, ...permutationResults];
+              
+              // Güncellenmiş sonuçları Redis'e kaydet
+              await redisClient.set(SUBFINDER_RESULT_KEY_PREFIX + id, JSON.stringify(results));
+            }
+          }
+        } catch (wordlistError) {
+          console.error('Wordlist okuma hatası:', wordlistError);
+        }
+      }
+      
+      // Derinlemesine DNS araştırması
+      if (options.deepDnsSearch) {
+        console.log(`Derinlemesine DNS araştırması başlatılıyor: ${domain}`);
+        const additionalDomains = await performDeepDnsSearch(domain);
+        
+        if (additionalDomains.length > 0) {
+          console.log(`DNS araştırmasından ${additionalDomains.length} ek domain bulundu. Bunlar için de tarama yapılacak.`);
+          
+          const dnsExpandedResults: any[] = [...results];
+          
+          // Her bir ek domain için tarama yap
+          for (const additionalDomain of additionalDomains) {
+            console.log(`Ek domain taranıyor: ${additionalDomain}`);
+            
+            try {
+              // Ek domain için tarama yap
+              const dnsDomainOutputFile = path.join(outputDir, `subfinder-${id}-dns-${additionalDomain.replace(/\./g, '-')}.json`);
+              const dnsDomainArgs = [
+                '-d', additionalDomain,
+                '-o', dnsDomainOutputFile,
+                '-oJ',
+                '-all',
+              ];
+              
+              if (options.timeout) dnsDomainArgs.push('-timeout', options.timeout.toString());
+              if (options.concurrency) dnsDomainArgs.push('-t', options.concurrency.toString());
+              if (options.onlyActive) dnsDomainArgs.push('-nW');
+              
+              const dnsDomainCommand = `subfinder ${dnsDomainArgs.join(' ')}`;
+              console.log(`DNS domain tarama komutu: ${dnsDomainCommand}`);
+              
+              const { stdout, stderr } = await execAsync(dnsDomainCommand, { 
+                timeout: 600000, // 10 dakika
+                maxBuffer: 5 * 1024 * 1024, // 5MB buffer
+              });
+              
+              // DNS domain tarama sonuçlarını oku
+              const dnsDomainFileExists = await fs.stat(dnsDomainOutputFile).catch(() => false);
+              
+              if (dnsDomainFileExists) {
+                const dnsDomainResultData = await fs.readFile(dnsDomainOutputFile, 'utf-8');
+                
+                if (dnsDomainResultData && dnsDomainResultData.trim()) {
+                  const dnsDomainResults = dnsDomainResultData
+                    .split('\n')
+                    .filter(line => line.trim() !== '')
+                    .map(line => {
+                      try {
+                        return JSON.parse(line);
+                      } catch (e) {
+                        return null;
+                      }
+                    })
+                    .filter(item => item !== null);
+                
+                console.log(`DNS domain taraması tamamlandı (${additionalDomain}): ${dnsDomainResults.length} sonuç bulundu`);
+                
+                // Sonuçları ana sonuç listesine ekle
+                for (const dnsResult of dnsDomainResults) {
+                  // Duplicate kontrolü
+                  const isDuplicate = dnsExpandedResults.some(
+                    er => er.host === dnsResult.host
+                  );
+                  
+                  if (!isDuplicate) {
+                    // DNS araştırmasından gelen sonuçları işaretle
+                    dnsResult.source = Array.isArray(dnsResult.source) 
+                      ? [...dnsResult.source, 'dns-extended-search'] 
+                      : ['dns-extended-search'];
+                    
+                    dnsExpandedResults.push(dnsResult);
+                  }
+                }
+              }
+            } catch (dnsDomainError) {
+              console.error(`DNS domain tarama hatası (${additionalDomain}):`, dnsDomainError);
+            }
+          }
+          
+          // Genişletilmiş sonuçları Redis'e kaydet
+          console.log(`DNS genişletilmiş sonuçlar: ${dnsExpandedResults.length} adet sonuç (önceki: ${results.length})`);
+          await redisClient.set(SUBFINDER_RESULT_KEY_PREFIX + id, JSON.stringify(dnsExpandedResults));
+          
+          // Sonuç sayısını güncelle
+          results = dnsExpandedResults;
+        }
+      }
+      
+      // Wayback Machine taraması
+      if (options.useWaybackMachine) {
+        console.log(`Wayback Machine taraması başlatılıyor: ${domain}`);
+        const waybackDomains = await getWaybackDomains(domain);
+        
+        if (waybackDomains.length > 0) {
+          console.log(`Wayback Machine'den ${waybackDomains.length} ek subdomain bulundu`);
+          
+          // Wayback'ten bulunan domain'leri sonuçlara ekle
+          const waybackResults = waybackDomains.map(host => ({
+            host,
+            source: ['wayback-machine'],
+            input: domain
+          }));
+          
+          // Duplicate kontrolü
+          const uniqueWaybackResults = waybackResults.filter(waybackResult => {
+            return !results.some(result => result.host === waybackResult.host);
+          });
+          
+          if (uniqueWaybackResults.length > 0) {
+            console.log(`${uniqueWaybackResults.length} benzersiz wayback subdomain'i sonuçlara ekleniyor`);
+            results = [...results, ...uniqueWaybackResults];
+            
+            // Güncellenmiş sonuçları Redis'e kaydet
+            await redisClient.set(SUBFINDER_RESULT_KEY_PREFIX + id, JSON.stringify(results));
+          }
+        }
+      }
+      
+      // Sonuçları Redis'e kaydet
+      if (results.length > 0) {
+        await redisClient.set(SUBFINDER_RESULT_KEY_PREFIX + id, JSON.stringify(results));
+        console.log(`SubFinder sonuçları Redis'e kaydedildi (${id}): ${results.length} adet sonuç`);
+        
+        // Alt domain üzerinden genişleme yap (jobData.options.useRecursive etkinse)
+        if (jobData.options.useRecursive && results.length > 0) {
+          console.log(`Alt domain üzerinden genişleme başlatılıyor (${id}): ${results.length} alt domain için`);
+          
+          const expandedResults: any[] = [...results];
+          const processedHosts = new Set<string>();
+          
+          // En önemli görünen 5 alt domain seç
+          const domainsToScan = results
+            .filter(result => {
+              // Ana domaine çok benzeyen veya kritik alt domainleri seç
+              const host = result.host;
+              return host.includes('api') || 
+                     host.includes('admin') || 
+                     host.includes('dev') || 
+                     host.includes('test') || 
+                     host.includes('staging') ||
+                     host.includes('web') ||
+                     host.includes('mail');
+            })
+            .slice(0, 5); // En fazla 5 alt domain tara
+          
+          console.log(`Özyinelemeli tarama için seçilen alt domainler: ${domainsToScan.map(d => d.host).join(', ')}`);
+          
+          // Her bir seçilen alt domain için, onun alt domain'lerini tara
+          for (const result of domainsToScan) {
+            const host = result.host;
+            
+            // Zaten işlenmiş domain'leri atla
+            if (processedHosts.has(host)) continue;
+            processedHosts.add(host);
+            
+            // Alt domain'i tara
+            console.log(`Alt domain taranıyor: ${host}`);
+            
+            try {
+              // Alt domain için tarama yap
+              const altDomainOutputFile = path.join(outputDir, `subfinder-${id}-altdomain-${host.replace(/\./g, '-')}.json`);
+              const altDomainArgs = [
+                '-d', host,
+                '-o', altDomainOutputFile,
+                '-oJ',
+                '-all',
+              ];
+              
+              if (options.timeout) altDomainArgs.push('-timeout', options.timeout.toString());
+              if (options.concurrency) altDomainArgs.push('-t', options.concurrency.toString());
+              if (options.onlyActive) altDomainArgs.push('-nW');
+              
+              const altDomainCommand = `subfinder ${altDomainArgs.join(' ')}`;
+              console.log(`Alt domain tarama komutu: ${altDomainCommand}`);
+              
+              const { stdout, stderr } = await execAsync(altDomainCommand, { 
+                timeout: 120000, // 2 dakika (10 dakika yerine)
+                maxBuffer: 5 * 1024 * 1024, // 5MB buffer
+              });
+              
+              // Alt domain tarama sonuçlarını oku
+              const altDomainFileExists = await fs.stat(altDomainOutputFile).catch(() => false);
+              
+              if (altDomainFileExists) {
+                const altDomainResultData = await fs.readFile(altDomainOutputFile, 'utf-8');
+                
+                if (altDomainResultData && altDomainResultData.trim()) {
+                  const altDomainResults = altDomainResultData
+                    .split('\n')
+                    .filter(line => line.trim() !== '')
+                    .map(line => {
+                      try {
+                        return JSON.parse(line);
+                      } catch (e) {
+                        return null;
+                      }
+                    })
+                    .filter(item => item !== null);
+                
+                console.log(`Alt domain taraması tamamlandı (${host}): ${altDomainResults.length} sonuç bulundu`);
+                
+                // Sonuçları ana sonuç listesine ekle
+                for (const altResult of altDomainResults) {
+                  // Duplicate kontrolü
+                  const isDuplicate = expandedResults.some(
+                    er => er.host === altResult.host
+                  );
+                  
+                  if (!isDuplicate) {
+                    // Alt domain taramasından gelen sonuçları işaretle
+                    altResult.source = Array.isArray(altResult.source) 
+                      ? [...altResult.source, 'recursive-search'] 
+                      : ['recursive-search'];
+                    
+                    expandedResults.push(altResult);
+                  }
+                }
+              }
+            } catch (altDomainError) {
+              console.error(`Alt domain tarama hatası (${host}):`, altDomainError);
+            }
+          }
+          
+          // Genişletilmiş sonuçları Redis'e kaydet
+          console.log(`Genişletilmiş sonuçlar: ${expandedResults.length} adet sonuç (önceki: ${results.length})`);
+          await redisClient.set(SUBFINDER_RESULT_KEY_PREFIX + id, JSON.stringify(expandedResults));
+          
+          // Sonuç sayısını güncelle
+          results = expandedResults;
+        }
+      } else {
+        console.warn(`SubFinder sonuçları Redis'e kaydedilmedi çünkü sonuç bulunamadı (${id})`);
+      }
+      
+      // Tarama durumunu güncelle
+      const updatedJobData = await getSubfinderScan(id);
+      if (updatedJobData) {
+        updatedJobData.status = 'completed';
+        await redisClient.set(SUBFINDER_KEY_PREFIX + id, JSON.stringify(updatedJobData));
+        console.log(`SubFinder taraması tamamlandı (${id}): ${results.length} sonuç bulundu`);
+      } else {
+        console.warn(`SubFinder taraması tamamlandı fakat veri güncellenemedi (${id})`);
+      }
+    } catch (error) {
+      console.error(`SubFinder taraması çalıştırılırken hata (${id}):`, error);
+      
+      // Tarama durumunu güncelle
+      const updatedJobData = await getSubfinderScan(id);
+      if (updatedJobData) {
+        updatedJobData.status = 'failed';
+        updatedJobData.error = String(error);
+        await redisClient.set(SUBFINDER_KEY_PREFIX + id, JSON.stringify(updatedJobData));
+      }
+    }
+  } catch (error) {
+    console.error(`SubFinder taraması çalıştırılırken hata (${id}):`, error);
+    
+    // Tarama durumunu güncelle
+    const updatedJobData = await getSubfinderScan(id);
+    if (updatedJobData) {
+      updatedJobData.status = 'failed';
+      updatedJobData.error = String(error);
+      await redisClient.set(SUBFINDER_KEY_PREFIX + id, JSON.stringify(updatedJobData));
+    }
+  }
+} 
